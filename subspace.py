@@ -210,8 +210,8 @@ def _residual_and_loss(params, model, X, Y):
 
 def _gn_solve(JP, r, B, k, damping):
     """Solve the reduced GN system: (JP^T JP / B + λI) Δu = -JP^T r / B."""
-    H_red = JP.T @ JP 
-    g_red = JP.T @ r 
+    H_red = (JP.T @ JP) / B + damping * jnp.eye(k)
+    g_red = (JP.T @ r) / B
     return jnp.linalg.solve(H_red, -g_red)
 
 
@@ -452,7 +452,7 @@ def train_iters(method: str, key, X_train, Y_train, X_val, Y_val, model,
                 metric_fn=None,
                 metric_name='metric',
                 preprocess_batch_fn=None,
-                k=20, damping=1e-4, lr=1.0, refresh_every=50,
+                k=20, damping=0, lr=1.0, refresh_every=50,
                 use_qr: bool = True,
                 adam_lr=1e-3, weight_decay=1e-2,
                 use_line_search: bool = True,
@@ -895,10 +895,10 @@ if __name__ == '__main__':
     subtitle    = 'MNIST Classification, MLP (128×64), batch=128'
 
     # ── Shared hyperparameters ─────────────────────────────────
-    N_ITERS     = 6000
+    N_ITERS     = 20000
     VAL_EVERY   = 50
     K           = 100        # random subspace columns for Exp A
-    REFRESH     = 200        # resample random cols every N steps
+    REFRESH     = 50        # resample random cols every N steps
     USE_QR      = True      # orthonormalise subspace via QR
 
     # k-sweep settings
@@ -907,7 +907,7 @@ if __name__ == '__main__':
 
     # Common GN hyperparameters
     GN_COMMON = dict(
-        damping=0,       # regularisation for the reduced GN solve
+        damping=1e-1,       # regularisation for the reduced GN solve
         lr=1.0,
         refresh_every=REFRESH,
         use_qr=USE_QR,

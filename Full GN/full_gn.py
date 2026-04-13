@@ -524,11 +524,11 @@ def plot_method_comparison(results, n_iters, noise_floor,
 if __name__ == '__main__':
     key = random.PRNGKey(42)
 
-    D         = 1000            # input dim  →  M = D+1
-    N         = 500         # number of training samples
+    D         = 500            # input dim  →  M = D+1
+    N         = 800         # number of training samples
     NOISE_STD = 0.5
     DAMPING  = 0
-    N_ITERS   = 300
+    N_ITERS   = 5000
     VAL_EVERY = 1
     REFRESH   = 1
     K         = int(0.004 * D)
