@@ -367,6 +367,8 @@ def _direction_hybrid_complement(params, opt_state_comp, opt_comp,
     # LS error of the total update direction (GN + adam complement).
     # J * delta_theta = JP @ delta_u  (already computed).
     # J * adam_vec requires one extra JVP.
+    B = X.shape[0]
+    k = P.shape[1]
     delta_u   = jnp.linalg.solve(JP.T @ JP / B + damping * jnp.eye(k), -(JP.T @ r) / B)   # reuse — cheap
     J_gn      = JP @ delta_u
     J_adam    = jvp_single(params, model, X, adam_update_vec)
@@ -586,8 +588,9 @@ def train_iters(method: str, key, X_train, Y_train, X_val, Y_val, model,
     key, init_key, p_key = random.split(key, 3)
     params = model.init(init_key, X_train[:1])
     M = params_to_vec(params).shape[0]
-    k_str = f'{k}+1(g)' if method == 'grad_augmented' else (
-            k if method != 'adamw' else '—')
+    grad_aug_methods = ('grad_augmented', 'grad_augmented_lm')
+    k_str = f'{k}+1(g)' if method in grad_aug_methods else (
+        k if method != 'adamw' else '—')
     print(f"  [{method}]  M={M},  k={k_str},  use_qr={use_qr}")
 
     # Initialise random subspace (methods that need it).
@@ -596,7 +599,7 @@ def train_iters(method: str, key, X_train, Y_train, X_val, Y_val, model,
     # covers all k+1 columns at once.  Other methods QR here if use_qr=True.
     if method == 'adamw':
         P_rand = None
-    elif method == 'grad_augmented':
+    elif method in grad_aug_methods:
         # Circular gradient buffer: starts as random Gaussians.
         # Column 0 is the eviction slot; each step it gets overwritten with
         # the current Adam gradient, then the buffer is rolled left by one.
@@ -660,7 +663,7 @@ def train_iters(method: str, key, X_train, Y_train, X_val, Y_val, model,
             batch_loss   = float(batch_loss)
             batch_ls_err = float(batch_ls_err)
 
-        elif method == 'grad_augmented':
+        elif method in grad_aug_methods:
             params, P_rand, opt_state_comp, batch_loss, batch_ls_err, current_damping = \
                 step_grad_augmented(
                     params, opt_state_comp, opt_comp,
@@ -682,7 +685,7 @@ def train_iters(method: str, key, X_train, Y_train, X_val, Y_val, model,
 
         # Refresh random columns on schedule.
         # grad_augmented manages its own buffer internally — no refresh needed.
-        if method not in ('adamw', 'grad_augmented') and step % refresh_every == 0:
+        if method not in ('adamw', 'grad_augmented', 'grad_augmented_lm') and step % refresh_every == 0:
             key, p_key = random.split(key)
             P_rand = random_subspace(p_key, M, k, use_qr=use_qr)
 
@@ -1023,7 +1026,7 @@ if __name__ == '__main__':
     key = random.PRNGKey(0)
 
     # ── Which experiments to run ───────────────────────────────
-    RUN_A = False    # baseline method comparison (M0, M1, M2, AdamW)
+    RUN_A = True    # baseline method comparison (M0, M1, M2, AdamW)
     RUN_B = True    # adaptive variants of M2 (LM / decay / both)
     RUN_C = False   # hybrid k-sweep vs AdamW
     RUN_D = False   # grad_augmented k-sweep vs AdamW
@@ -1043,9 +1046,9 @@ if __name__ == '__main__':
     subtitle    = 'MNIST Classification, MLP (128×64), batch=128'
 
     # ── Shared hyperparameters ─────────────────────────────────
-    N_ITERS     = 500
+    N_ITERS     = 6000
     VAL_EVERY   = 50
-    K           = 50
+    K           = 200
     REFRESH     = 50
     USE_QR      = True
 
@@ -1055,7 +1058,7 @@ if __name__ == '__main__':
 
     # Common GN hyperparameters (fixed damping baseline)
     GN_COMMON = dict(
-        damping=1e-1,
+        damping=0,
         lr=1.0,
         refresh_every=REFRESH,
         use_qr=USE_QR,
