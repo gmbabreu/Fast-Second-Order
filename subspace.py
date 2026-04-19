@@ -214,7 +214,6 @@ def _gn_solve(JP, r, B, k, damping):
     g_red = (JP.T @ r) / B
     return jnp.linalg.solve(H_red, -g_red)
 
-
 def gn_subspace_update_m0(params, model, loss_fn, X, Y, P, damping):
     """Pure subspace GN — no VJP needed."""
     k       = P.shape[1]
@@ -402,7 +401,7 @@ def _direction_grad_augmented(params, opt_state_comp, opt_comp, model, loss_fn,
     B           = X.shape[0]
     JP          = jp_matrix(params, model, X, P_prime)
 
-    delta_u     = _gn_solve(JP, r, B, k_prime, damping)
+    delta_u     = _gn_solve(JP,r , B, k_prime, damping)
     delta_theta = P_prime @ delta_u
     ls_err      = jnp.sum((JP @ delta_u + r) ** 2)
 
@@ -895,9 +894,9 @@ if __name__ == '__main__':
     subtitle    = 'MNIST Classification, MLP (128×64), batch=128'
 
     # ── Shared hyperparameters ─────────────────────────────────
-    N_ITERS     = 20000
+    N_ITERS     = 3000
     VAL_EVERY   = 50
-    K           = 100        # random subspace columns for Exp A
+    K           = 50        # random subspace columns for Exp A
     REFRESH     = 50        # resample random cols every N steps
     USE_QR      = True      # orthonormalise subspace via QR
 

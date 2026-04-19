@@ -530,7 +530,7 @@ if __name__ == '__main__':
     DAMPING  = 0
     N_ITERS   = 5000
     VAL_EVERY = 1
-    REFRESH   = 1
+    REFRESH   = 2500
     K         = int(0.004 * D)
 
     key, data_key = random.split(key)
