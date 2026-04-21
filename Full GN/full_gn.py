@@ -44,6 +44,7 @@ import optax
 import numpy as np
 import matplotlib.pyplot as plt
 import time
+from scipy import linalg
 
 print("JAX devices:", jax.devices())
 
@@ -157,6 +158,54 @@ def _gn_solve(JP, r, damping):
     g = JP.T @ r / B
     H = H + damping * jnp.eye(H.shape[0])
     return jnp.linalg.solve(H, -g)
+
+
+def hessian_spectrum(JP, r, damping=0.0):
+    """
+    Compute eigenvalues and eigenvectors of the Gauss-Newton Hessian.
+
+    H = JP^T @ JP / B + damping * I
+
+    Args:
+        JP: (B, k) Jacobian-Projection matrix
+        r: (B,) residual vector
+        damping: regularization parameter
+
+    Returns:
+        eigenvalues: (k,) sorted in descending order
+        eigenvectors: (k, k) columns are eigenvectors
+    """
+    B = r.shape[0]
+    H = np.array(JP.T @ JP / B)
+    if damping > 0:
+        H = H + damping * np.eye(H.shape[0])
+
+    eigenvalues, eigenvectors = linalg.eigh(H)
+
+    # Sort by magnitude (descending)
+    idx = np.argsort(-np.abs(eigenvalues))
+    eigenvalues = eigenvalues[idx]
+    eigenvectors = eigenvectors[:, idx]
+
+    return eigenvalues, eigenvectors
+
+
+def analyze_spectrum(eigenvalues):
+    """
+    Print summary statistics of the Hessian spectrum.
+
+    Args:
+        eigenvalues: array of eigenvalues
+    """
+    evals = np.array(eigenvalues)
+    print(f"    Spectrum shape: {evals.shape}")
+    print(f"    Max eigenvalue:     {evals[0]:.6e}")
+    print(f"    Min eigenvalue:     {evals[-1]:.6e}")
+    print(f"    Condition number:   {evals[0] / (np.abs(evals[-1]) + 1e-16):.6e}")
+    print(f"    Mean eigenvalue:    {np.mean(evals):.6e}")
+    print(f"    Median eigenvalue:  {np.median(evals):.6e}")
+    print(f"    Num positive evals: {np.sum(evals > 1e-10)}/{len(evals)}")
+    print(f"    Num negative evals: {np.sum(evals < -1e-10)}/{len(evals)}")
 
 
 _DEFAULT_LS_ALPHAS = tuple(2.0 ** (-i / 2) for i in range(10))
@@ -337,6 +386,7 @@ def train(method, key,
     iter_list, train_list, ls_list = [], [], []
     val_iter_list, val_loss_list   = [], []
     step_time_list                 = []
+    spectrum_history               = []
 
     step     = 0
     rec_step = 0
@@ -357,6 +407,16 @@ def train(method, key,
         t0 = time.perf_counter()
 
         if method == 'full_gn':
+            # Compute spectrum before step (for analysis)
+            if step % 50 == 0:
+                loss_pre, r_pre = residual_and_loss(params, X_b, y_b)
+                JP_pre = jp_matrix(params, X_b, P)
+                eigenvalues, _ = hessian_spectrum(JP_pre, r_pre, damping=damping)
+                spectrum_history.append((step, eigenvalues.copy()))
+                if step % 500 == 0 and step > 0:
+                    print(f"\n  Step {step} spectrum analysis:")
+                    analyze_spectrum(eigenvalues)
+
             params, bloss, bls = _gn_step(params, X_b, y_b, P, damping)
             #params, opt_state, bloss, bls = _hybrid_step(params, opt_state, opt, X_b, y_b, P, damping,            use_line_search=use_line_search, ls_alphas=ls_alphas)
         elif method == 'subspace_gn':
@@ -428,6 +488,7 @@ def train(method, key,
         'val_metric': np.array([]),
         'step_times': np.array(step_time_list),
         'total_time': total_time,
+        'spectrum_history': spectrum_history,
     }
 
 
@@ -450,6 +511,44 @@ STYLES = {
     'adamw':           dict(color='#3a7ebf', lw=2, ls=':',
                             label='Baseline: AdamW'),
 }
+
+
+def plot_spectrum_evolution(spectrum_history, save_path="spectrum_evolution.png"):
+    """
+    Plot eigenvalue magnitude evolution over training steps.
+
+    spectrum_history: list of (step, eigenvalues) tuples
+    """
+    if not spectrum_history:
+        print("No spectrum history to plot.")
+        return
+
+    steps = [s[0] for s in spectrum_history]
+    max_evals = [np.max(np.abs(s[1])) for s in spectrum_history]
+    min_evals = [np.min(np.abs(s[1])) for s in spectrum_history]
+    condition_nums = [np.max(np.abs(s[1])) / (np.min(np.abs(s[1])) + 1e-16) for s in spectrum_history]
+
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
+
+    # Plot 1: Min/Max eigenvalues
+    ax1.semilogy(steps, max_evals, 'o-', label='Max |λ|', linewidth=2)
+    ax1.semilogy(steps, min_evals, 's-', label='Min |λ|', linewidth=2)
+    ax1.set_xlabel('Step')
+    ax1.set_ylabel('Eigenvalue magnitude')
+    ax1.set_title('Hessian spectrum bounds')
+    ax1.legend()
+    ax1.grid(True, alpha=0.3)
+
+    # Plot 2: Condition number
+    ax2.semilogy(steps, condition_nums, 'o-', color='#d62728', linewidth=2)
+    ax2.set_xlabel('Step')
+    ax2.set_ylabel('Condition number')
+    ax2.set_title('Hessian condition number evolution')
+    ax2.grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=150, bbox_inches='tight')
+    print(f"Saved spectrum evolution → {save_path}")
 
 
 def _label_with_time(key, res):
@@ -609,3 +708,9 @@ if __name__ == '__main__':
         results, n_iters=N_ITERS, noise_floor=noise_floor,
         subtitle=f'Linear model, d={D}, n={N}, k={K}, noise_std={NOISE_STD}',
         save_path='full_gn_sanity.png')
+
+    # Plot spectrum evolution for full_gn if available
+    if 'spectrum_history' in results['full_gn']:
+        plot_spectrum_evolution(
+            results['full_gn']['spectrum_history'],
+            save_path='spectrum_evolution.png')
