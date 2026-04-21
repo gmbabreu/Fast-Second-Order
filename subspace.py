@@ -937,7 +937,7 @@ if __name__ == '__main__':
     subtitle    = 'MNIST Classification, MLP (128×64), batch=128'
 
     # ── Shared hyperparameters ─────────────────────────────────
-    N_ITERS     = 3000
+    N_ITERS     = 6000
     VAL_EVERY   = 50
     K           = 50        # random subspace columns for Exp A
     REFRESH     = 50        # resample random cols every N steps
@@ -951,7 +951,7 @@ if __name__ == '__main__':
     # Optional: use learning rate scheduling (e.g., exponential or step-based decay)
     # lr_sched = lambda step, lr0: lr_schedule_exp(step, lr0, decay_rate=0.9998)
     GN_COMMON = dict(
-        damping=1e-1,       # regularisation for the reduced GN solve
+        damping=0,       # regularisation for the reduced GN solve
         lr=1.0,
         refresh_every=REFRESH,
         use_qr=USE_QR,
