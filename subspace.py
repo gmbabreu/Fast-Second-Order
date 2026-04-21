@@ -443,6 +443,17 @@ def step_adamw(params, opt_state, opt, model, loss_fn, X, Y):
 WARMUP_STEPS = 10
 
 
+def lr_schedule_exp(step: int, lr_0: float, decay_rate: float = 0.9999):
+    """Exponential decay: lr(step) = lr_0 * decay_rate^step."""
+    return lr_0 * (decay_rate ** step)
+
+
+def lr_schedule_step(step: int, lr_0: float, decay_steps: int = 500,
+                      decay_factor: float = 0.96):
+    """Step-based decay: lr decreases by factor every decay_steps iterations."""
+    return lr_0 * (decay_factor ** (step // decay_steps))
+
+
 def train_iters(method: str, key, X_train, Y_train, X_val, Y_val, model,
                 loss_fn,
                 n_iters:    int   = 2000,
@@ -456,6 +467,7 @@ def train_iters(method: str, key, X_train, Y_train, X_val, Y_val, model,
                 adam_lr=1e-3, weight_decay=1e-2,
                 use_line_search: bool = True,
                 ls_alphas=_DEFAULT_LS_ALPHAS,
+                lr_schedule_fn=None,
                 ):
     """
     Train for `n_iters` recorded steps (plus WARMUP_STEPS discarded steps).
@@ -476,6 +488,8 @@ def train_iters(method: str, key, X_train, Y_train, X_val, Y_val, model,
                     to the AdamW baseline.
     ls_alphas     : Tuple of candidate step-size multipliers evaluated by
                     the line search (default: 2^{0}, 2^{-1/2}, ..., 2^{-2}).
+    lr_schedule_fn : Optional callable(step, lr_0) -> lr that schedules learning
+                    rate decay over iterations. If None, constant lr is used.
     """
     key, init_key, p_key = random.split(key, 3)
     params = model.init(init_key, X_train[:1])
@@ -504,13 +518,25 @@ def train_iters(method: str, key, X_train, Y_train, X_val, Y_val, model,
 
     iter_list, train_list, step_time_list         = [], [], []
     val_iter_list, val_loss_list, val_metric_list = [], [], []
-    ls_err_list                                   = []
+    rel_err_list                                  = []
 
     # step  : total steps taken (including warmup)
     # rec_step : recorded steps (post-warmup)
     step     = 0
     rec_step = 0
     t_start  = None
+    initial_residual_norm = None
+
+    # Add initial validation loss at iteration 0 (before any training)
+    X_ve_init, Y_ve_init = X_val, Y_val
+    if preprocess_batch_fn is not None:
+        X_ve_init, Y_ve_init = preprocess_batch_fn(X_val, Y_val)
+    initial_val_loss = float(loss_fn(params, model, X_ve_init, Y_ve_init))
+    val_iter_list.append(0)
+    val_loss_list.append(initial_val_loss)
+    if metric_fn is not None:
+        initial_metric = float(metric_fn(params, model, X_ve_init, Y_ve_init))
+        val_metric_list.append(initial_metric)
 
     print(f"  Warming up ({WARMUP_STEPS} steps)...", end=" ", flush=True)
 
@@ -530,9 +556,19 @@ def train_iters(method: str, key, X_train, Y_train, X_val, Y_val, model,
 
         t0 = time.perf_counter()
 
+        # Apply learning rate schedule if provided
+        current_lr = lr
+        if lr_schedule_fn is not None:
+            current_lr = lr_schedule_fn(step, lr)
+
+        # Compute initial residual norm on first step
+        if initial_residual_norm is None:
+            _, initial_r = _residual_and_loss(params, model, X_b, Y_b)
+            initial_residual_norm = jnp.sqrt(jnp.sum(initial_r ** 2))
+
         if method == 'pure_subspace':
             params, batch_loss, batch_ls_err = step_pure_subspace(
-                params, model, loss_fn, X_b, Y_b, P_rand, damping, lr,
+                params, model, loss_fn, X_b, Y_b, P_rand, damping, current_lr,
                 use_line_search=use_line_search, ls_alphas=ls_alphas)
             jax.effects_barrier()
             batch_loss   = float(batch_loss)
@@ -541,7 +577,7 @@ def train_iters(method: str, key, X_train, Y_train, X_val, Y_val, model,
         elif method == 'hybrid_complement':
             params, opt_state_comp, batch_loss, batch_ls_err = step_hybrid_complement(
                 params, opt_state_comp, opt_comp,
-                model, loss_fn, X_b, Y_b, P_rand, damping, lr,
+                model, loss_fn, X_b, Y_b, P_rand, damping, current_lr,
                 use_line_search=use_line_search, ls_alphas=ls_alphas)
             jax.effects_barrier()
             batch_loss   = float(batch_loss)
@@ -550,7 +586,7 @@ def train_iters(method: str, key, X_train, Y_train, X_val, Y_val, model,
         elif method == 'grad_augmented':
             params, opt_state_comp, batch_loss, batch_ls_err = step_grad_augmented(
                 params, opt_state_comp, opt_comp,
-                model, loss_fn, X_b, Y_b, P_rand, damping, use_qr, lr,
+                model, loss_fn, X_b, Y_b, P_rand, damping, use_qr, current_lr,
                 use_line_search=use_line_search, ls_alphas=ls_alphas)
             jax.effects_barrier()
             batch_loss   = float(batch_loss)
@@ -586,7 +622,12 @@ def train_iters(method: str, key, X_train, Y_train, X_val, Y_val, model,
 
         iter_list.append(rec_step)
         train_list.append(batch_loss)
-        ls_err_list.append(batch_ls_err)
+        # Compute relative error (normalized by initial residual norm)
+        if method != 'adamw' and initial_residual_norm > 0:
+            rel_err = jnp.sqrt(batch_ls_err) / initial_residual_norm
+            rel_err_list.append(float(rel_err))
+        else:
+            rel_err_list.append(float('nan'))
         step_time_list.append(step_dur)
         rec_step += 1
 
@@ -617,7 +658,7 @@ def train_iters(method: str, key, X_train, Y_train, X_val, Y_val, model,
     return {
         'iter':        np.array(iter_list),
         'train_loss':  np.array(train_list),
-        'ls_err':      np.array(ls_err_list),
+        'rel_err':     np.array(rel_err_list),
         'val_iter':    np.array(val_iter_list),
         'val_loss':    np.array(val_loss_list),
         'val_metric':  np.array(val_metric_list),
@@ -757,19 +798,20 @@ def plot_method_comparison(results: dict, n_iters: int, k: int,
     ax_val.legend(fontsize=8)
     ax_val.grid(True, alpha=0.3)
 
-    # --- New Panel: Inner LS Error ---
+    # --- New Panel: Inner Relative Error ---
     for method, res in results.items():
-        # AdamW produces NaNs for LS error; we only plot valid subspace data
-        if len(res['iter']) > 0 and not np.all(np.isnan(res['ls_err'])):
+        # AdamW produces NaNs for relative error; we only plot valid subspace data
+        if len(res['iter']) > 0 and not np.all(np.isnan(res['rel_err'])):
             style = dict(STYLES[method])
-            ax_ls.plot(res['iter'], res['ls_err'], color=style['color'], alpha=0.15)
-            ax_ls.plot(res['iter'], get_ema(res['ls_err']), **style)
+            ax_ls.plot(res['iter'], res['rel_err'], color=style['color'], alpha=0.15)
+            ax_ls.plot(res['iter'], get_ema(res['rel_err']), **style)
 
     ax_ls.set_xlabel('Iteration')
-    ax_ls.set_ylabel('Inner LS Error')
-    ax_ls.set_title('(C) Inner Optimization Error')
+    ax_ls.set_ylabel('Relative Error')
+    ax_ls.set_title('(C) Inner Optimization Error (relative)')
+    ax_ls.set_xscale('log')
     ax_ls.set_yscale('log')
-    ax_ls.set_xlim(0, n_iters)
+    ax_ls.set_xlim(1, n_iters)
     ax_ls.grid(True, alpha=0.3)
 
     plt.suptitle(
@@ -875,7 +917,8 @@ if __name__ == '__main__':
     key = random.PRNGKey(0)
 
     # ── Which experiments to run ───────────────────────────────
-    RUN_A = True    # method comparison at fixed k (all 4 methods)
+    RUN_A = True    # method comparison at fixed k (all 4 methods, no lr schedule)
+    RUN_B = True   # method comparison with learning rate scheduling
     RUN_C = False    # hybrid k-sweep vs AdamW
     RUN_D = False    # grad_augmented k-sweep vs AdamW
 
@@ -905,6 +948,8 @@ if __name__ == '__main__':
     N_ITERS_K   = 2000
 
     # Common GN hyperparameters
+    # Optional: use learning rate scheduling (e.g., exponential or step-based decay)
+    # lr_sched = lambda step, lr0: lr_schedule_exp(step, lr0, decay_rate=0.9998)
     GN_COMMON = dict(
         damping=1e-1,       # regularisation for the reduced GN solve
         lr=1.0,
@@ -912,6 +957,7 @@ if __name__ == '__main__':
         use_qr=USE_QR,
         adam_lr=1e-3,
         weight_decay=1e-2,
+        # lr_schedule_fn=lr_sched,  # uncomment to enable learning rate decay
     )
 
     # ══════════════════════════════════════════════════════════
@@ -946,6 +992,121 @@ if __name__ == '__main__':
             metric_name=metric_name,
             subtitle=f'{subtitle},  k={K}',
             save_path='results_method_comparison.png')
+
+    # ══════════════════════════════════════════════════════════
+    # Experiment B — compare all methods with different LR schedules
+    # Tests exponential decay vs step-based decay vs no scheduling.
+    # ══════════════════════════════════════════════════════════
+    if RUN_B:
+        print("\n" + "═"*55)
+        print("  EXPERIMENT B — LR scheduling comparison")
+        print("═"*55)
+
+        # Define the two schedules to compare (more aggressive than before)
+        lr_sched_exp = lambda step, lr0: lr_schedule_exp(step, lr0, decay_rate=0.999)
+        lr_sched_step = lambda step, lr0: lr_schedule_step(step, lr0, decay_steps=300,
+                                                            decay_factor=0.90)
+
+        GN_EXP_SCHED = dict(**GN_COMMON, lr_schedule_fn=lr_sched_exp)
+        GN_STEP_SCHED = dict(**GN_COMMON, lr_schedule_fn=lr_sched_step)
+
+        # Run all 3 GN methods with each schedule variant
+        # (Baseline "no_schedule" results are reused from Exp A)
+        results_B_variants = {'no_schedule': results_A}  # Reuse from Exp A
+
+        for sched_name, gn_config in [('exp_decay', GN_EXP_SCHED),
+                                       ('step_decay', GN_STEP_SCHED)]:
+            print(f"\n  ─ Schedule variant: {sched_name}")
+            EXPERIMENTS = [
+                ('pure_subspace', dict(k=K, **gn_config)),
+                ('hybrid_complement', dict(k=K, **gn_config)),
+                ('grad_augmented', dict(k=K, **gn_config)),
+                ('adamw', dict(adam_lr=1e-3, weight_decay=1e-2)),
+            ]
+
+            results, key = run_method_comparison(
+                key, X_train, Y_train, X_val, Y_val, model, loss_fn,
+                EXPERIMENTS, N_ITERS, batch_size, VAL_EVERY,
+                metric_fn=metric_fn, metric_name=metric_name,
+                preprocess_batch_fn=preprocess_batch,
+            )
+            results_B_variants[sched_name] = results
+            print_summary_table(results, metric_name=metric_name)
+
+            # Plot individual variant
+            plot_method_comparison(
+                results, n_iters=N_ITERS, k=K,
+                metric_name=metric_name,
+                subtitle=f'{subtitle},  k={K},  {sched_name}',
+                save_path=f'results_method_comparison_{sched_name}.png')
+
+        # ── Compare all three schedules side-by-side ──────────────────
+        print("\n" + "─"*55)
+        print("  Schedule Comparison: Exponential vs Step-based vs None")
+        print("─"*55)
+
+        fig, axes = plt.subplots(3, 3, figsize=(18, 12))
+
+        def get_ema(data, beta=0.95):
+            data = np.array(data)
+            if len(data) == 0: return data
+            ema = np.zeros_like(data)
+            ema[0] = data[0]
+            for i in range(1, len(data)):
+                ema[i] = beta * ema[i-1] + (1 - beta) * data[i]
+            return ema
+
+        schedule_names = ['no_schedule', 'exp_decay', 'step_decay']
+        schedule_labels = ['No Schedule', 'Exponential (0.9998)', 'Step-based (decay=0.96)']
+        schedule_colors = ['#888888', '#e07b39', '#2ca02c']
+
+        # Row per schedule, column per method
+        methods_to_compare = ['pure_subspace', 'hybrid_complement', 'grad_augmented']
+
+        for row, (sched_name, sched_label, sched_color) in enumerate(
+            zip(schedule_names, schedule_labels, schedule_colors)):
+
+            results_variant = results_B_variants[sched_name]
+
+            for col, method in enumerate(methods_to_compare):
+                res = results_variant[method]
+                style = STYLES[method]
+
+                # Val loss
+                ax = axes[row, col]
+                if len(res['val_iter']) > 0:
+                    ax.plot(res['val_iter'], res['val_loss'],
+                           color=sched_color, lw=2.5, label=sched_label)
+                ax.set_xlabel('Iteration')
+                ax.set_ylabel('Validation loss')
+                ax.set_title(f'{style["label"]} — {sched_label}')
+                ax.set_yscale('log')
+                ax.set_xlim(0, N_ITERS)
+                ax.grid(True, alpha=0.3)
+                ax.legend(fontsize=8)
+
+        plt.suptitle(f'Learning Rate Schedules Comparison: Validation Loss\n{subtitle}\n'
+                    f'Exp: decay=0.999 | Step: every 300 steps by 0.90',
+                    fontsize=12, y=0.995)
+        plt.tight_layout()
+        plt.savefig('results_lr_schedule_comparison.png', dpi=150, bbox_inches='tight')
+        print(f"Saved → results_lr_schedule_comparison.png")
+
+        # ── Summary: Final val loss for each method × schedule ──────────
+        print("\n" + "─"*55)
+        print("  Final Validation Loss by Method and Schedule")
+        print("─"*55)
+        summary_w = 75
+        print(f"{'Method':<30} {'No Schedule':>15} {'Exp Decay':>15} {'Step Decay':>15}")
+        print('─' * summary_w)
+        for method in methods_to_compare:
+            row = f"  {STYLES[method]['label']:<28}"
+            for sched_name in schedule_names:
+                res = results_B_variants[sched_name][method]
+                vl = float(res['val_loss'][-1]) if len(res['val_loss']) > 0 else float('nan')
+                row += f" {vl:>15.5f}"
+            print(row)
+        print('─' * summary_w)
 
     # ══════════════════════════════════════════════════════════
     # Experiment C — hybrid k-sweep vs AdamW
